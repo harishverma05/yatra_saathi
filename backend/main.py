@@ -153,13 +153,22 @@ async def ask(audio: UploadFile = File(...), landmark: str = Form(...), lang: st
 
 
 @app.post("/api/interpret")
-async def interpret(audio: UploadFile = File(...), src: str = Form("en"), tgt: str = Form("hi")):
+async def interpret(
+    audio: UploadFile = File(...),
+    src: str = Form("auto"),
+    tgt: str = Form("auto"),
+):
     try:
         data, fn, ct = await read_upload(audio)
-        heard, translated, audio_bytes = await eleven.translate_audio(data, fn, ct, src, tgt)
+        heard, translated, actual_src, actual_tgt, speaker, audio_bytes = await eleven.translate_audio(
+            data, fn, ct, src, tgt
+        )
         return {
             "text": heard,
             "translation": translated,
+            "src": actual_src,
+            "tgt": actual_tgt,
+            "speaker": speaker,
             "audio_url": save_audio(audio_bytes),
         }
     except HTTPException:

@@ -134,8 +134,8 @@ def sanitize_audio_meta(filename: str, content_type: str) -> tuple[str, str]:
     return "audio.mp4", "audio/mp4"
 
 
-async def stt(audio: bytes, filename: str, content_type: str, lang: str | None = None) -> str:
-    """Speech-to-text using ElevenLabs Scribe API with xi-api-key header."""
+async def stt_full(audio: bytes, filename: str, content_type: str, lang: str | None = None) -> tuple[str, str]:
+    """Speech-to-text using ElevenLabs Scribe. Returns (transcribed_text, detected_language_code)."""
     key, _, stt_model, _ = get_config()
     if not key:
         raise ValueError("ELEVENLABS_API_KEY is not set. Please add it to backend/.env")
@@ -145,45 +145,59 @@ async def stt(audio: bytes, filename: str, content_type: str, lang: str | None =
     # 1. Primary: Official ElevenLabs SDK
     try:
         client = ElevenLabs(api_key=key)
-        # Wrap audio as (filename, BytesIO, content_type) tuple for proper format detection
         file_tuple = (clean_fn, io.BytesIO(audio), clean_ct)
+        lang_code = SCRIBE_LANG.get(lang) if (lang and lang != "auto") else None
         res = client.speech_to_text.convert(
             file=file_tuple,
             model_id=stt_model,
-            language_code=SCRIBE_LANG.get(lang) if lang else None,
+            language_code=lang_code,
         )
         usage_stats["stt_calls"] += 1
-        return (res.text or "").strip()
+        text = (res.text or "").strip()
+        detected = (getattr(res, "language_code", "") or "").lower()
+        return text, detected
 
     except Exception:
-        # 2. Fallback: Direct REST API with xi-api-key header
+        # Fallback to direct REST API
         data = {"model_id": stt_model}
-        if lang in SCRIBE_LANG:
+        if lang and lang in SCRIBE_LANG:
             data["language_code"] = SCRIBE_LANG[lang]
         r = await _client.post(
             "https://api.elevenlabs.io/v1/speech-to-text",
             headers={"xi-api-key": key},
             data=data,
-            files={"file": (filename, audio, content_type)},
+            files={"file": (clean_fn, audio, clean_ct)},
         )
         if r.status_code != 200:
             raise RuntimeError(f"ElevenLabs STT error ({r.status_code}): {r.text}")
         usage_stats["stt_calls"] += 1
-        return r.json().get("text", "").strip()
+        text = r.json().get("text", "").strip()
+        detected = (r.json().get("language_code", "") or "").lower()
+        return text, detected
+
+
+async def stt(audio: bytes, filename: str, content_type: str, lang: str | None = None) -> str:
+    """Convenience wrapper for Speech-to-Text returning text."""
+    text, _ = await stt_full(audio, filename, content_type, lang)
+    return text
 
 
 async def translate_audio(
     audio: bytes,
     filename: str,
     content_type: str,
-    src_lang: str,
-    tgt_lang: str,
-) -> tuple[str, str, bytes]:
+    src_lang: str = "auto",
+    tgt_lang: str = "auto",
+) -> tuple[str, str, str, str, str, bytes]:
     """
-    Live Translation using ONLY ElevenLabs:
-    1. Transcribes source voice via ElevenLabs Scribe.
-    2. Translates speech and generates dubbed voice via ElevenLabs Dubbing API.
-    3. Retrieves translated transcript and dubbed audio directly from ElevenLabs.
+    Live Automatic Translation using ONLY ElevenLabs:
+    1. Transcribes source voice via ElevenLabs Scribe with automatic language detection.
+    2. Automatically routes direction:
+       - Tourist speaks English -> Translates to Hindi (Local hears)
+       - Local speaks Hindi -> Translates to English (Tourist hears)
+    3. Translates speech and generates dubbed voice via ElevenLabs Dubbing API.
+    4. Retrieves translated transcript and dubbed audio directly from ElevenLabs.
+    Returns: (heard_text, translated_text, actual_src, actual_tgt, speaker, dubbed_audio)
     """
     key, _, _, _ = get_config()
     if not key:
@@ -191,20 +205,41 @@ async def translate_audio(
 
     clean_fn, clean_ct = sanitize_audio_meta(filename, content_type)
 
-    # 1. Get heard text using ElevenLabs STT
-    heard_text = await stt(audio, clean_fn, clean_ct, src_lang)
+    # 1. Transcribe & auto-detect language with ElevenLabs Scribe
+    heard_text, detected_code = await stt_full(audio, clean_fn, clean_ct, src_lang if src_lang != "auto" else None)
 
-    if src_lang == tgt_lang:
-        return heard_text, heard_text, audio
+    # 2. Determine source and target language automatically
+    is_hindi = (
+        "hin" in detected_code
+        or src_lang == "hi"
+        or any("\u0900" <= ch <= "\u097f" for ch in heard_text)
+    )
 
-    # 2. Translate and dub using ElevenLabs Dubbing API
+    if src_lang == "auto" or not src_lang:
+        if is_hindi:
+            actual_src = "hi"
+            actual_tgt = "en"
+            speaker = "Local (हिन्दी)"
+        else:
+            actual_src = "en"
+            actual_tgt = "hi"
+            speaker = "Tourist (English)"
+    else:
+        actual_src = src_lang
+        actual_tgt = tgt_lang if tgt_lang != "auto" else ("hi" if src_lang == "en" else "en")
+        speaker = "Tourist (English)" if actual_src == "en" else "Local (हिन्दी)"
+
+    if actual_src == actual_tgt:
+        return heard_text, heard_text, actual_src, actual_tgt, speaker, audio
+
+    # 3. Translate and dub using ElevenLabs Dubbing API
     client = ElevenLabs(api_key=key)
     file_tuple = (clean_fn, io.BytesIO(audio), clean_ct)
 
     dub = client.dubbing.create(
         file=file_tuple,
-        source_lang=src_lang,
-        target_lang=tgt_lang,
+        source_lang=actual_src,
+        target_lang=actual_tgt,
     )
     dub_id = dub.dubbing_id
 
@@ -218,17 +253,16 @@ async def translate_audio(
             break
 
     if status != "dubbed":
-        # Graceful fallback: synthesize TTS in target language if dubbing times out
-        fallback_audio = await tts(heard_text, tgt_lang)
-        return heard_text, heard_text, fallback_audio
+        fallback_audio = await tts(heard_text, actual_tgt)
+        return heard_text, heard_text, actual_src, actual_tgt, speaker, fallback_audio
 
-    # 3. Retrieve dubbed audio bytes from ElevenLabs
-    audio_gen = client.dubbing.audio.get(dubbing_id=dub_id, language_code=tgt_lang)
+    # 4. Retrieve dubbed audio bytes from ElevenLabs
+    audio_gen = client.dubbing.audio.get(dubbing_id=dub_id, language_code=actual_tgt)
     dubbed_audio = b"".join(audio_gen) if hasattr(audio_gen, "__iter__") else audio_gen
 
-    # 4. Retrieve translated text transcript from ElevenLabs
+    # 5. Retrieve translated text transcript from ElevenLabs
     r = await _client.get(
-        f"https://api.elevenlabs.io/v1/dubbing/{dub_id}/transcript/{tgt_lang}",
+        f"https://api.elevenlabs.io/v1/dubbing/{dub_id}/transcript/{actual_tgt}",
         headers={"xi-api-key": key},
     )
     translated_text = ""
@@ -240,10 +274,9 @@ async def translate_audio(
         ]
         translated_text = " ".join(lines).strip()
 
-    # Clean up dubbing job on ElevenLabs
     try:
         client.dubbing.delete(dubbing_id=dub_id)
     except Exception:
         pass
 
-    return heard_text, translated_text or heard_text, dubbed_audio
+    return heard_text, translated_text or heard_text, actual_src, actual_tgt, speaker, dubbed_audio
