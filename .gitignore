@@ -1,0 +1,33 @@
+# Secrets and Environment Variables
+.env
+*.env
+backend/.env
+!.env.example
+!backend/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.npm
+
+# Audio cache & generated temp files
+backend/cache/
+*.mp3
+*.webm
+*.wav
+
+# System files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
